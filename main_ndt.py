@@ -1,8 +1,10 @@
 import dearpygui.dearpygui as dpg
 import numpy as np
 import time
+import torch
 from ndt_engine import TaichiWaveSolver
 from ndt_dsp import NDTSignalProcessor
+from ndt_model import NDTNet
 
 class NDTApp:
     def __init__(self):
@@ -24,6 +26,18 @@ class NDTApp:
         
         # Signal Generation: Shorter pulse (0.05s) for better spatial resolution
         self.chirp_t, self.chirp_sig = self.dsp.generate_chirp(100, 300, 0.05)
+        
+        # AI Model Initialization
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.model = NDTNet().to(self.device)
+        try:
+            self.model.load_state_dict(torch.load("ndt_cnn_model.pth", map_location=self.device))
+            self.model.eval()
+            print(f"CNN Model loaded successfully on {self.device}")
+            self.model_loaded = True
+        except Exception as e:
+            print(f"Warning: Could not load CNN model: {e}")
+            self.model_loaded = False
         
         self.setup_dpg()
 
@@ -53,6 +67,7 @@ class NDTApp:
                         dpg.add_slider_float(label="Y", default_value=self.sensor_coords[i][1], min_value=0.05, max_value=0.95, callback=self.update_params, tag=f"sy_{i}")
 
             with dpg.collapsing_header(label="EXPERIMENT CONTROLS", default_open=True):
+                dpg.add_combo(label="Method", items=["Classic TDOA", "AI (CNN)"], default_value="Classic TDOA", tag="loc_method")
                 dpg.add_button(label="INJECT PULSE & START", width=-1, height=40, callback=self.start_sim)
                 dpg.add_button(label="RESET SIMULATION", width=-1, callback=self.reset_sim)
             
@@ -166,44 +181,64 @@ class NDTApp:
         dpg.set_value("prob_tex", tex_data.flatten())
 
     def perform_localization(self):
-        arrival_times = [0.0] * 4 # Index 0 is source
-        # Wave speed in normalized units (0-1) per step
-        # FDTD speed is c_norm pixels/step, resolution is res
-        unit_velocity = self.wave_velocity / self.res 
-        
-        # Analyze each sensor for echo peaks
-        for i in range(1, 4):
-            raw = np.array(self.sensor_data[i])
-            if len(raw) > 0:
-                comp, env = self.dsp.process_signal(raw, self.chirp_sig)
-                
-                # --- DIRECT PATH BLANKING ---
-                # Calculate time of arrival for direct wave (in steps)
-                dist_direct = np.sqrt(
-                    (self.sensor_coords[i][0] - self.sensor_coords[0][0])**2 + 
-                    (self.sensor_coords[i][1] - self.sensor_coords[0][1])**2
-                )
-                direct_arrival_steps = dist_direct / unit_velocity
-                
-                # Blank the direct pulse (arrival time + pulse duration)
-                # Pulse duration in samples is chirp_sig length
-                blank_window = int(direct_arrival_steps + len(self.chirp_sig) * 0.8)
-                
-                env_masked = env.copy()
-                if blank_window < len(env_masked):
-                    env_masked[:blank_window] = 0.0
-                
-                # Peak detection: Look for the first significant peak after blanking
-                threshold = np.max(env_masked) * 0.5
-                peaks = np.where(env_masked > threshold)[0]
-                
-                if peaks.size > 0:
-                    # Echo arrival in normalized units
-                    arrival_times[i] = peaks[0] * unit_velocity
-        
-        # Call DSP localization with corrected speed
+        method = dpg.get_value("loc_method")
         grid_res = 50
-        X, Y, prob_map = self.dsp.locate_defect(self.sensor_coords, arrival_times, 1.0, grid_res)
+        
+        if method == "AI (CNN)" and self.model_loaded:
+            # Prepare data for CNN: (1, 4, 800)
+            data = np.zeros((1, 4, self.max_steps), dtype=np.float32)
+            for i in range(4):
+                # Ensure we have exactly 800 samples
+                s_data = np.array(self.sensor_data[i])[:self.max_steps]
+                data[0, i, :len(s_data)] = s_data
+            
+            with torch.no_grad():
+                x_tensor = torch.from_numpy(data).to(self.device)
+                prob_map = self.model(x_tensor).cpu().squeeze().numpy()
+            
+            # Create coordinate grid for display
+            x = np.linspace(0, 1, grid_res)
+            y = np.linspace(0, 1, grid_res)
+            X, Y = np.meshgrid(x, y)
+        else:
+            # Classic TDOA
+            arrival_times = [0.0] * 4 # Index 0 is source
+            # Wave speed in normalized units (0-1) per step
+            # FDTD speed is c_norm pixels/step, resolution is res
+            unit_velocity = self.wave_velocity / self.res 
+            
+            # Analyze each sensor for echo peaks
+            for i in range(1, 4):
+                raw = np.array(self.sensor_data[i])
+                if len(raw) > 0:
+                    comp, env = self.dsp.process_signal(raw, self.chirp_sig)
+                    
+                    # --- DIRECT PATH BLANKING ---
+                    # Calculate time of arrival for direct wave (in steps)
+                    dist_direct = np.sqrt(
+                        (self.sensor_coords[i][0] - self.sensor_coords[0][0])**2 + 
+                        (self.sensor_coords[i][1] - self.sensor_coords[0][1])**2
+                    )
+                    direct_arrival_steps = dist_direct / unit_velocity
+                    
+                    # Blank the direct pulse (arrival time + pulse duration)
+                    # Pulse duration in samples is chirp_sig length
+                    blank_window = int(direct_arrival_steps + len(self.chirp_sig) * 0.8)
+                    
+                    env_masked = env.copy()
+                    if blank_window < len(env_masked):
+                        env_masked[:blank_window] = 0.0
+                    
+                    # Peak detection: Look for the first significant peak after blanking
+                    threshold = np.max(env_masked) * 0.5
+                    peaks = np.where(env_masked > threshold)[0]
+                    
+                    if peaks.size > 0:
+                        # Echo arrival in normalized units
+                        arrival_times[i] = peaks[0] * unit_velocity
+            
+            # Call DSP localization with corrected speed
+            X, Y, prob_map = self.dsp.locate_defect(self.sensor_coords, arrival_times, 1.0, grid_res)
         
         # Update Heatmap Texture
         self.update_heatmap_texture(prob_map)
